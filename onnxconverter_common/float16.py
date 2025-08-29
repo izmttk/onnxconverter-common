@@ -220,6 +220,10 @@ def convert_float_to_float16(
         raise ValueError(
             "The model is already converted to float16, if convert again, the model might be wrong. \n If you are sure to convert again, please set check_fp16_ready=False."
         )
+        
+    global_output_type_dict = {
+        output.name: output.type.tensor_type.elem_type for output in model.graph.output
+    }
 
     graph_stack = [model.graph]
 
@@ -248,7 +252,9 @@ def convert_float_to_float16(
                 min_positive_val,
                 max_finite_val,
             )
-            process_graph_output(curr_graph, is_top_level, keep_io_types)
+            process_graph_output(
+                curr_graph, is_top_level, keep_io_types, global_output_type_dict
+            )
             sub_graph_list = get_next_level_graph(
                 curr_graph, op_block_list, node_block_list
             )
@@ -326,11 +332,12 @@ def process_graph_input(
 
 
 def process_graph_output(
-    graph: onnx_proto.GraphProto, is_top_level: bool, is_io_fp32: bool
+    graph: onnx_proto.GraphProto, is_top_level: bool, is_io_fp32: bool, global_output_type_dict: dict
 ):
     if is_top_level and is_io_fp32:  # the output dtype is float32, need to cast to fp16
         for i, graph_output in enumerate(graph.output):
-            if graph_output.type.tensor_type.elem_type == onnx_proto.TensorProto.FLOAT:
+            if global_output_type_dict[graph_output.name] == onnx_proto.TensorProto.FLOAT:
+                graph_output.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT
                 upstream_nodes = find_upstream_node_by_output_name(
                     graph, graph_output.name
                 )
