@@ -723,7 +723,7 @@ def remove_unnecessary_cast_node(graph_proto: onnx_proto.GraphProto):
 
     # 2. find upstream and downstream node of the cast node
     cast_node_upstream_dict = {}  # mapping cast node(name) to its upstream node
-    cast_node_downstream_dict = {}  # mapping cast node(name) to its downstream node
+    cast_node_downstream_dict = {}  # mapping cast node(name) to its downstream nodes
     for current_node in graph_proto.node:
         # find the downstream node(s)
         for input_name in current_node.input:
@@ -731,21 +731,9 @@ def remove_unnecessary_cast_node(graph_proto: onnx_proto.GraphProto):
                 # found the downstream node of the cast node, might be multiple
                 cast_node = output_name_to_cast_node_dict[input_name]
                 if cast_node.name not in cast_node_downstream_dict:
-                    cast_node_downstream_dict[cast_node.name] = current_node
-                else:  # already exists one downstream node, make it a list
-                    existing_downstream_nodes = cast_node_downstream_dict[
-                        cast_node.name
-                    ]
-                    if isinstance(existing_downstream_nodes, list):
-                        existing_downstream_nodes.append(current_node)
-                    else:  # make a list
-                        existing_downstream_nodes = [
-                            existing_downstream_nodes,
-                            current_node,
-                        ]
-                        cast_node_downstream_dict[cast_node.name] = (
-                            existing_downstream_nodes
-                        )
+                    cast_node_downstream_dict[cast_node.name] = [current_node]
+                else:
+                    cast_node_downstream_dict[cast_node.name].append(current_node)
         # find the upstream node
         for output_name in current_node.output:
             if output_name in input_name_to_cast_node_dict:
@@ -761,65 +749,83 @@ def remove_unnecessary_cast_node(graph_proto: onnx_proto.GraphProto):
 
     # 4. find the cast(to16) node which downstream is Cast(to32)
     remove_candidate = []
-    for cast_node_name, downstream_node in cast_node_downstream_dict.items():
+    for cast_node_name, downstream_nodes in cast_node_downstream_dict.items():
         cast_node = name_to_node_dict[cast_node_name]
-        if isinstance(downstream_node, list):
-            for dn in downstream_node:
-                if (
-                    dn.op_type == "Cast"
-                    and dn.attribute[0].i == 32
-                    and cast_node.attribute[0].i == 16
-                    and dn in cast_node_list
-                    and cast_node in cast_node_list
-                ):
-                    remove_candidate.append((cast_node, dn))
-        else:
+        for dn in downstream_nodes:
             if (
-                downstream_node.op_type == "Cast"
-                and cast_node.attribute[0].i == 10
-                and downstream_node.attribute[0].i == 1
-                and downstream_node in cast_node_list
+                dn.op_type == "Cast"
+                and cast_node.attribute[0].i == onnx_proto.TensorProto.FLOAT16
+                and dn.attribute[0].i == onnx_proto.TensorProto.FLOAT
+                and dn in cast_node_list
                 and cast_node in cast_node_list
             ):
-                remove_candidate.append((cast_node, downstream_node))
+                remove_candidate.append((cast_node, dn))
 
+
+    output_names = [output.name for output in graph_proto.output]
     # 5. change the connection of "upstream->cast16->cast32->downstream" to "upstream->downstream"
     for cast_node_pair in remove_candidate:
         first_cast_node = cast_node_pair[0]
         second_cast_node = cast_node_pair[1]
         upstream_node = cast_node_upstream_dict.get(first_cast_node.name)
-        downstream_node = cast_node_downstream_dict.get(second_cast_node.name)
-        if upstream_node is None and downstream_node is not None:
-            # The upstream_node should be graph input
-            out = first_cast_node.input[0]
-            for i, input_name in enumerate(downstream_node.input):
-                for output_name in second_cast_node.output:
-                    if input_name == output_name:
-                        # change the input as the upstream node's output
-                        downstream_node.input[i] = out
-        elif upstream_node is not None and downstream_node is None:
-            raise ValueError(
-                "The downstream node of the second cast node should be graph output"
-            )
-        else:
-            # find the upstream node's output to first_cast_node
-            out = None
-            for output_name in upstream_node.output:
-                if output_name == first_cast_node.input[0]:
-                    out = output_name
+        downstream_nodes = cast_node_downstream_dict.get(second_cast_node.name)
+
+        if second_cast_node.output[0] in output_names:
+            for i, output in enumerate(upstream_node.output):
+                if output == first_cast_node.input[0]:
+                    upstream_node.output[i] = second_cast_node.output[0]
                     break
+                
+            del second_cast_node.output[0]
+            continue
+
+        if downstream_nodes is not None:
+            upstream_out = first_cast_node.input[0]
             # find the downstream node's input as second_cast_node's output
-            for i, input_name in enumerate(downstream_node.input):
-                for output_name in second_cast_node.output:
-                    if input_name == output_name:
+            for dn in downstream_nodes:
+                for i, input_name in enumerate(dn.input):
+                    if input_name == second_cast_node.output[0]:
                         # change the input as the upstream node's output
-                        downstream_node.input[i] = out
+                        dn.input[i] = upstream_out
 
     # 6. remove the cast node pair
+    # TODO: need optimization
     for cast_node_pair in remove_candidate:
-        graph_proto.node.remove(cast_node_pair[0])
-        graph_proto.node.remove(cast_node_pair[1])
+        cast_node = cast_node_pair[1]
+        remove_node_if_unused(graph_proto, cast_node)
+        cast_node = cast_node_pair[0]
+        remove_node_if_unused(graph_proto, cast_node)
 
+
+def remove_node_if_unused(graph_proto: onnx_proto.GraphProto, node: onnx_proto.NodeProto):
+    # check if any node use the output of this node
+    for n in graph_proto.node:
+        for input_name in n.input:
+            # still have node use the output of the node to be removed
+            if input_name in node.output:
+                return
+    # if no node use the output of this node, remove it
+    graph_proto.node.remove(node)
+    # remove the output value_info
+    for value_info in graph_proto.value_info:
+        if value_info.name in node.output:
+            graph_proto.value_info.remove(value_info)
+            break
+    # remove the input value_info if not used by any other node
+    for input_name in node.input:
+        is_input_used = False
+        for n in graph_proto.node:
+            for in_name in n.input:
+                if input_name == in_name:
+                    is_input_used = True
+                    break
+            if is_input_used:
+                break
+        if not is_input_used:
+            for value_info in graph_proto.value_info:
+                if value_info.name == input_name:
+                    graph_proto.value_info.remove(value_info)
+                    break
 
 # Check if the model is already converted to float16
 def check_if_fp16_ready(graph_proto):
