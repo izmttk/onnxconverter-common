@@ -490,6 +490,31 @@ def process_initializers(
         if (node.op_type in op_block_list) or (node.name in node_block_list):
             for input_name in node.input:  # some is initializer, some is value_info, can't distinguish but doesn't matter
                 initializer_block_list.add(input_name)
+    # 如果在 initializer_block_list 中的一个 initializer 有多个输出，并且这些输出对应的 node 不在 node_block_list 中，则
+    # 统计所有不在 node_block_list 的输出 node，复制一个 initializer 并转换为 fp16 给这些 node 使用
+    for initializer in graph.initializer:
+        if initializer.name in initializer_block_list:
+            downstream_nodes = find_donwstream_node_by_input_name(graph, initializer.name)
+            # nodes need to cast
+            outside_nodes = []
+            for d_node in downstream_nodes:
+                if (d_node.op_type not in op_block_list) and (
+                    d_node.name not in node_block_list
+                ):
+                    outside_nodes.append(d_node)
+            if len(outside_nodes) > 0:
+                # need to copy a new initializer and convert to fp16
+                new_initializer = onnx_proto.TensorProto()
+                new_initializer.CopyFrom(initializer)
+                new_initializer.name = (
+                    initializer.name + "_cast_to_" + outside_nodes[0].name
+                )
+                graph.initializer.extend([new_initializer])
+                # change the input of the outside nodes to the new initializer
+                for out_node in outside_nodes:
+                    for i, input_name in enumerate(out_node.input):
+                        if input_name == initializer.name:
+                            out_node.input[i] = new_initializer.name
     # Process initializers
     for initializer in graph.initializer:
         if initializer.name not in initializer_block_list:
