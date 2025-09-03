@@ -481,7 +481,19 @@ def process_value_info(graph: onnx_proto.GraphProto, value_info_block_list: list
         else:
             if value_info.type.tensor_type.elem_type == onnx_proto.TensorProto.FLOAT:
                 value_info.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
-
+    # process preexisting Cast node
+    for node in graph.node:
+        if node.op_type == "Cast":
+            output_name = node.output[0]
+            value_info = None
+            for value_info in graph.value_info:
+                if value_info.name == output_name:
+                    break
+            if (
+                value_info and
+                value_info.type.tensor_type.elem_type == onnx_proto.TensorProto.FLOAT16
+            ):
+                node.attribute[0].i = onnx_proto.TensorProto.FLOAT16
 
 # Initializer is 'edge' type, so doesn't have value_info
 def process_initializers(
